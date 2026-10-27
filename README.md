@@ -107,8 +107,11 @@ docker compose down
 
 | 상태 | 버전 |
 |------|------|
-| **취약** | PHP 5.x ~ 8.4.26 (Chain D는 8.4 + mod_php prefork) |
-| **패치** | 8.4.27+ / 8.3.22+ / 8.2.28+ / 8.1.33+ / 7.4.33-31+ (Sury) |
+| **취약** | PHP 8.4.0 ~ 8.4.26 (mod_php prefork 한정) |
+| **패치** | 8.4.27+ |
+
+> [!IMPORTANT]
+> **PHP 7.4 검증 완료** — 동일 조건(prefork, memory_limit=128M, session.upload_progress=On, ASLR=2)에서 10회 시도, B1 heap leak 전부 실패(`no heap pointers in leak window`). Chain D의 heap 유출 메커니즘은 8.4의 session.upload_progress 리팩토링에 의존하며, 7.x/8.0~8.3에서는 작동하지 않습니다.
 
 ## 방어
 
