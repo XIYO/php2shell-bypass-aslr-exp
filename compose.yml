@@ -1,0 +1,17 @@
+# PHP2Shell (CVE-2026-109618/109619) 실습 환경
+# 취약 버전: php:8.4.26-apache (패치 전)
+services:
+  target:
+    image: php:8.4.26-apache
+    container_name: p2s-lab
+    ports:
+      - "127.0.0.1:18120:80"
+    volumes:
+      - ./www:/var/www/html
+      - ./out:/out
+    command: >
+      /bin/sh -c '
+        cp /usr/local/etc/php/php.ini-production /usr/local/etc/php/php.ini;
+        chown -R www-data:www-data /out /var/www/html 2>/dev/null || true;
+        exec apache2-foreground'
+    restart: unless-stopped
